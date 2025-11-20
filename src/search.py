@@ -24,7 +24,7 @@ class SearchCircleMission(Node):
 
         # Subscribers
         self.create_subscription(Image, '/flir_camera/image_raw', self.camera_cb, 10)
-        self.create_subscription(PointCloud2, '/ouster/points', self.lidar_cb, 10)
+        self.create_subscription(Point, '/obstacle_centroids', self.centroid_cb, 10)
         self.create_subscription(Imu, '/mavros/imu/data', self.imu_cb, 10)
         self.create_subscription(State, '/mavros/state', self.state_cb, 10)
 
@@ -89,11 +89,16 @@ class SearchCircleMission(Node):
         self.mode_client.call_async(mode_req)
 
     def camera_cb(self, msg):
-        if self.yaw_aligned:
-            return
-
         try:
+            # 항상 frame 먼저 읽기
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+            # yaw 정렬 완료되면 화면만 유지
+            if self.yaw_aligned:
+                cv2.imshow("Theia Camera", frame)
+                cv2.waitKey(10)
+                return
+
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             center_x = self.image_width // 2
 
@@ -105,16 +110,21 @@ class SearchCircleMission(Node):
             }
 
             target_info = None
-            for color_name in ["yellow", "red1", "red2", "green"]:
-                lower, upper = np.array(color_ranges[color_name][0]), np.array(color_ranges[color_name][1])
+            mask_red1 = None
+
+            for cname in ["yellow", "red1", "red2", "green"]:
+                lower = np.array(color_ranges[cname][0])
+                upper = np.array(color_ranges[cname][1])
                 mask = cv2.inRange(hsv, lower, upper)
 
-                if color_name == "red1":
+                if cname == "red1":
                     mask_red1 = mask
                     continue
-                elif color_name == "red2":
+
+                if cname == "red2" and mask_red1 is not None:
                     mask = cv2.bitwise_or(mask_red1, mask)
 
+                # Morphology
                 mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
                 mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
@@ -123,17 +133,17 @@ class SearchCircleMission(Node):
                     continue
 
                 c = max(contours, key=cv2.contourArea)
-                area = cv2.contourArea(c)
-                if area < 400:
+                if cv2.contourArea(c) < 400:
                     continue
 
                 x, y, w, h = cv2.boundingRect(c)
                 cx = int(x + w / 2)
                 yaw_error = ((cx - center_x) / center_x) * (self.hfov_deg / 2)
 
-                if self.target_color in color_name:
+                if self.target_color in cname:
                     target_info = yaw_error
 
+            # 찾지 못했을 때
             if target_info is None:
                 self.yaw_aligned = False
                 self.publish_vel(0.0, 0.0)
@@ -141,19 +151,14 @@ class SearchCircleMission(Node):
                 cv2.waitKey(10)
                 return
 
-            yaw_error = target_info
-            if abs(yaw_error) > 5.0:
-                turn_speed = 0.2 * math.copysign(1, yaw_error)
+            # yaw 오차에 따라 회전
+            if abs(target_info) > 5.0:
+                turn_speed = 0.2 * math.copysign(1, target_info)
                 self.publish_vel(0.0, turn_speed)
             else:
                 self.publish_vel(0.0, 0.0)
                 self.yaw_aligned = True
-                if self.target_color in ["red", "green"]:
-                    self.turn_dir = 1
-                elif self.target_color == "yellow":
-                    self.turn_dir = -1
-                else:
-                    self.turn_dir = 1
+                self.turn_dir = 1 if self.target_color in ["red", "green"] else -1
 
             cv2.imshow("Theia Camera", frame)
             cv2.waitKey(10)
@@ -161,51 +166,29 @@ class SearchCircleMission(Node):
         except Exception as e:
             self.get_logger().warn(f"Camera error: {e}")
 
-    def lidar_cb(self, msg):
-        if not self.yaw_aligned:
-            return
+            
+    def centroid_cb(self, msg: Point):
+        # DBSCAN에서 퍼블리시된 중심점 → 로컬 좌표계 기준
+        self.center_x = msg.x
+        self.center_y = msg.y
 
-        try:
-            points_iter = pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
-            points = np.array(list(points_iter))
-            if len(points) == 0:
-                return
+        # 중심점까지의 거리
+        self.closest_dist = math.sqrt(msg.x**2 + msg.y**2)
 
-            mask = np.abs(np.arctan2(points[:, 1], points[:, 0])) < math.radians(10)
-            front = points[mask]
-            if len(front) == 0:
-                return
+        self.get_logger().info(
+            f"[DBSCAN] Obstacle centroid = ({self.center_x:.2f}, {self.center_y:.2f}), dist={self.closest_dist:.2f}"
+        )
 
-            dists = np.sqrt(front[:, 0] ** 2 + front[:, 1] ** 2)
-            min_idx = np.argmin(dists)
-            closest = front[min_idx]
-            self.closest_dist = float(np.min(dists))
+        # 반경 진입 여부 체크
+        if self.closest_dist <= self.approach_dist and not self.start_circle:
+            self.publish_vel(0.0, 0.0)
+            self.get_logger().info("Reached 3m from centroid. Creating circle path.")
+            self.create_circle_path()
+            self.start_circle = True
 
-            self.center_x, self.center_y = closest[0], closest[1]
-            self.get_logger().info(f"Detected buoy local center=({self.center_x:.2f}, {self.center_y:.2f}), dist={self.closest_dist:.2f}m")
-
-            if self.closest_dist > self.approach_dist:
-
-                if self.center_point is not None:
-                    cx, cy = self.center_point
-                    yaw_error_lidar = math.atan2(cy, cx)
-                    angular_z = self.kp_yaw * yaw_error_lidar
-                else:
-                    angular_z = 0.0
-
-                self.publish_vel(0.3, angular_z)
-
-            else:
-                self.publish_vel(0.0, 0.0)
-                self.get_logger().info("Reached 3m radius. Generating circle path.")
-                self.create_circle_path()
-                self.start_circle = True
-
-        except Exception as e:
-            self.get_logger().error(f"LiDAR error: {e}")
 
     def create_circle_path(self):
-        path = Path()
+        path = Path()                                      
         path.header.frame_id = "map"
         self.path_points = []
 
