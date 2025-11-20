@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import rclpy
+from ultralytics import YOLO
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import math
 import numpy as np
 import cv2
 from cv_bridge import CvBridge
 from sensor_msgs_py import point_cloud2 as pc2
 from geometry_msgs.msg import Twist, PoseStamped, Point
-from sensor_msgs.msg import PointCloud2, Image, Imu
+from sensor_msgs.msg import PointCloud2, Image, Imu 
 from nav_msgs.msg import Path
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, SetMode
@@ -18,15 +20,32 @@ class SearchCircleMission(Node):
     def __init__(self):
         super().__init__('search_circle_mission_mavros')
 
+        self.declare_parameter('yolo_model_path', 'weights/docking_rsp.pt')
+        self.yolo_model_path = (
+            self.get_parameter('yolo_model_path')
+            .get_parameter_value()
+            .string_value
+        )
+        self.get_logger().info(f"[YOLO] Model path = {self.yolo_model_path}")
+
+        # 모델 로드
+        self.model = YOLO(self.yolo_model_path)
+        self.get_logger().info("[YOLO] Model loaded successfully")
         # Publisher
         self.vel_pub = self.create_publisher(Twist, '/mavros/setpoint_velocity/cmd_vel_unstamped', 10)
         self.path_pub = self.create_publisher(Path, '/circle_path', 10)
 
+        imu_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
         # Subscribers
         self.create_subscription(Image, '/flir_camera/image_raw', self.camera_cb, 10)
         self.create_subscription(Point, '/obstacle_centroids', self.centroid_cb, 10)
-        self.create_subscription(Imu, '/mavros/imu/data', self.imu_cb, 10)
         self.create_subscription(State, '/mavros/state', self.state_cb, 10)
+        self.create_subscription(Imu, '/mavros/imu/data', self.imu_cb, imu_qos)
 
         # center_point (LiDAR 상대좌표 입력)
         self.center_point = None
@@ -38,7 +57,7 @@ class SearchCircleMission(Node):
 
         # Common variables
         self.bridge = CvBridge()
-        self.target_color = "red"
+        self.target_color = "Scissors"
         self.yaw_aligned = False
         self.closest_dist = None
         self.approach_dist = 2.0
@@ -93,78 +112,85 @@ class SearchCircleMission(Node):
             # 항상 frame 먼저 읽기
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
 
-            # yaw 정렬 완료되면 화면만 유지
-            if self.yaw_aligned:
-                cv2.imshow("Theia Camera", frame)
-                cv2.waitKey(10)
-                return
-
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             center_x = self.image_width // 2
-
-            color_ranges = {
-                "red1": ([0, 80, 80], [10, 255, 255]),
-                "red2": ([160, 80, 80], [179, 255, 255]),
-                "green": ([35, 60, 60], [85, 255, 255]),
-                "yellow": ([15, 80, 80], [55, 255, 255]),
-            }
-
             target_info = None
-            mask_red1 = None
 
-            for cname in ["yellow", "red1", "red2", "green"]:
-                lower = np.array(color_ranges[cname][0])
-                upper = np.array(color_ranges[cname][1])
-                mask = cv2.inRange(hsv, lower, upper)
+            # ------------------------------
+            # YOLO 추론
+            # ------------------------------
+            results = self.model(frame, verbose=False)
 
-                if cname == "red1":
-                    mask_red1 = mask
-                    continue
+            for r in results:
+                for box in r.boxes:
+                    cls = int(box.cls[0])
+                    cls_name = r.names[cls]
 
-                if cname == "red2" and mask_red1 is not None:
-                    mask = cv2.bitwise_or(mask_red1, mask)
+                    # YOLO 클래스가 목표 색(또는 목표 객체) 아니면 패스
+                    if cls_name != self.target_color:
+                        continue
 
-                # Morphology
-                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+                    # bbox 중심점 계산
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    cx = int((x1 + x2) / 2)
 
-                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if len(contours) == 0:
-                    continue
-
-                c = max(contours, key=cv2.contourArea)
-                if cv2.contourArea(c) < 400:
-                    continue
-
-                x, y, w, h = cv2.boundingRect(c)
-                cx = int(x + w / 2)
-                yaw_error = ((cx - center_x) / center_x) * (self.hfov_deg / 2)
-
-                if self.target_color in cname:
+                    # yaw error 계산
+                    yaw_error = ((cx - center_x) / center_x) * (self.hfov_deg / 2)
                     target_info = yaw_error
 
-            # 찾지 못했을 때
+                    # 디버깅용 bbox 출력
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0,255,0), 2)
+                    cv2.putText(frame, f"{cls_name} yaw={yaw_error:.1f}",
+                                (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7, (255,255,255), 2)
+
+            # ------------------------------
+            # 타겟이 안 보이면 정지 (단, 카메라 창은 계속 나옴)
+            # ------------------------------
             if target_info is None:
+                self.publish_vel(0.0, 0.0)
                 self.yaw_aligned = False
-                self.publish_vel(0.0, 0.0)
-                cv2.imshow("Theia Camera", frame)
-                cv2.waitKey(10)
-                return
 
-            # yaw 오차에 따라 회전
-            if abs(target_info) > 5.0:
-                turn_speed = 0.2 * math.copysign(1, target_info)
-                self.publish_vel(0.0, turn_speed)
             else:
-                self.publish_vel(0.0, 0.0)
-                self.yaw_aligned = True
-                self.turn_dir = 1 if self.target_color in ["red", "green"] else -1
+                yaw_error = target_info
 
-            cv2.imshow("Theia Camera", frame)
-            cv2.waitKey(10)
+                # ------------------------------
+                # Yaw 정렬 여부 판단 (±5°)
+                # ------------------------------
+                if abs(yaw_error) > 5.0:
+                    # 정렬 전 → 회전 계속
+                    turn_speed = 0.2 * math.copysign(1, yaw_error)
+                    self.publish_vel(0.0, turn_speed)
+                    self.yaw_aligned = False
+                else:
+                    # 정렬 완료
+                    self.publish_vel(0.0, 0.0)
+                    self.yaw_aligned = True
+
+                    # 색(또는 객체)에 따라 회전 방향 설정
+                    if self.target_color in ["Paper", "Rock"]:
+                        self.turn_dir = 1
+                    elif self.target_color == "Scissors":
+                        self.turn_dir = -1
+                    else:
+                        self.turn_dir = 1
+
+                    self.get_logger().info(
+                        f"[{self.target_color}] yaw 정렬 완료 → "
+                        f"{'시계방향' if self.turn_dir == 1 else '반시계방향'} 회전 준비"
+                    )
 
         except Exception as e:
             self.get_logger().warn(f"Camera error: {e}")
+
+        # ------------------------------
+        # 항상 마지막에 카메라 창 출력 (반드시 try/except 밖에 있어야 함)
+        # ------------------------------
+        try:
+            cv2.imshow("Theia Camera", frame)
+            cv2.waitKey(1)
+        except:
+            pass
+
 
             
     def centroid_cb(self, msg: Point):
