@@ -4,6 +4,7 @@ import rclpy
 from ultralytics import YOLO
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from visualization_msgs.msg import MarkerArray
 import math
 import numpy as np
 import cv2
@@ -49,7 +50,7 @@ class SearchCircleMission(Node):
 
         # Subscribers
         self.create_subscription(Image, '/flir_camera/image_raw', self.camera_cb, 10)
-        self.create_subscription(Point, '/obstacle_centroids', self.centroid_cb, 10)
+        self.create_subscription(MarkerArray, '/obstacle_centroids', self.centroid_cb, 10)
         self.create_subscription(State, '/mavros/state', self.state_cb, 10)
         self.create_subscription(Imu, '/mavros/imu/data', self.imu_cb, imu_qos)
 
@@ -67,7 +68,7 @@ class SearchCircleMission(Node):
         self.target_color = "Scissors"
         self.yaw_aligned = False
         self.closest_dist = None    # 라이다에서 들어온 장애물까지의 거리
-        self.approach_dist = 3.0    # ★ 3 m 이내로 접근하면 원회전 시작
+        self.approach_dist = 2.5   # ★ 2.5 m 이내로 접근하면 원회전 시작
         self.hfov_deg = 90.0
         self.image_width = 1280
         self.current_yaw = 0.0
@@ -87,6 +88,16 @@ class SearchCircleMission(Node):
         self.completed = False
         self.current_state = None
         self.start_circle = False   # 원형 선회 시작 여부
+
+        self.yaw_aligned = False     # 현재 정렬 상태
+        self.yaw_finished = False    # ★ 한번 정렬 끝났는지 여부
+        
+        # ★ 부표 lock-on용 플래그
+        self.locked = False         # True면 특정 부표에 lock
+        self.locked_id = None       # lock된 Marker의 id
+
+
+        self.last_dist_log_time = None
 
         # Camera window
         cv2.startWindowThread()
@@ -120,42 +131,55 @@ class SearchCircleMission(Node):
     # ========== 카메라 + YOLO ==========
     def camera_cb(self, msg: Image):
         try:
-            # 항상 frame 먼저 읽기
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception as e:
+            self.get_logger().warn(f"Camera error: {e}")
+            return
 
-            center_x = self.image_width // 2
-            target_info = None
+        # ★ 한 번 yaw 정렬이 끝났으면, 이후에는 카메라로 yaw 제어 안 함
+        if self.yaw_finished:
+            try:
+                cv2.imshow("Theia Camera", frame)
+                cv2.waitKey(1)
+            except Exception:
+                pass
+            # yaw_aligned는 계속 True로 유지
+            self.yaw_aligned = True
+            return
 
-            # ------------------------------
-            # YOLO 추론
-            # ------------------------------
+        center_x = self.image_width // 2
+        target_info = None
+
+        # ------------------------------
+        # YOLO 추론
+        # ------------------------------
+        try:
             results = self.model(frame, verbose=False)
+        except Exception as e:
+            self.get_logger().warn(f"YOLO error: {e}")
+            return
 
-            for r in results:
-                for box in r.boxes:
-                    cls = int(box.cls[0])
-                    cls_name = r.names[cls]
+        for r in results:
+            for box in r.boxes:
+                cls = int(box.cls[0])
+                cls_name = r.names[cls]
 
-                    # YOLO 클래스가 목표 객체 아니면 패스
-                    if cls_name != self.target_color:
-                        continue
+                if cls_name != self.target_color:
+                    continue
 
-                    # bbox 중심점 계산
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    cx = int((x1 + x2) / 2)
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                cx = int((x1 + x2) / 2)
 
-                    # yaw error 계산 (도 단위)
-                    yaw_error = ((cx - center_x) / center_x) * (self.hfov_deg / 2)
+                yaw_error = ((cx - center_x) / center_x) * (self.hfov_deg / 2)
 
-                    # 디버깅용 bbox 출력
-                    cv2.rectangle(frame, (int(x1), int(y1)),
-                                  (int(x2), int(y2)), (0, 255, 0), 2)
-                    cv2.putText(frame, f"{cls_name} yaw={yaw_error:.1f}",
-                                (int(x1), int(y1) - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7, (255, 255, 255), 2)
+                cv2.rectangle(frame, (int(x1), int(y1)),
+                              (int(x2), int(y2)), (0, 255, 0), 2)
+                cv2.putText(frame, f"{cls_name} yaw={yaw_error:.1f}",
+                            (int(x1), int(y1) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (255, 255, 255), 2)
 
-                    target_info = yaw_error
+                target_info = yaw_error
 
             # ------------------------------
             # 타겟이 안 보이면 정지
@@ -179,6 +203,7 @@ class SearchCircleMission(Node):
                     # 정렬 완료
                     self.publish_vel(0.0, 0.0)
                     self.yaw_aligned = True
+                    self.yaw_finished = True 
 
                     # Rock/Paper/Scissors에 따라 회전 방향 설정 (예시)
                     if self.target_color in ["Paper", "Rock"]:
@@ -193,9 +218,6 @@ class SearchCircleMission(Node):
                         f"{'시계방향' if self.turn_dir == 1 else '반시계방향'} 회전 준비"
                     )
 
-        except Exception as e:
-            self.get_logger().warn(f"Camera error: {e}")
-
         # ------------------------------
         # 항상 마지막에 카메라 창 출력
         # ------------------------------
@@ -206,36 +228,89 @@ class SearchCircleMission(Node):
             pass
 
     # ========== 라이다 중심점 ==========
-    def centroid_cb(self, msg: Point):
-        """
-        /obstacle_centroids 로 들어오는 점들 중
-        정면(+) 기준 ±10도 이내에 있는 것만 사용.
-        그 점에 대한 거리 로그를 찍고,
-        이후 control_loop에서 3m까지 직진 → 원회전.
-        """
-        # x: 전방(+), y: 좌측(+) 가정
-        angle_rad = math.atan2(msg.y, msg.x)
-        angle_deg = math.degrees(angle_rad)
-
-        # 정면 ±10도 밖이면 무시
-        if abs(angle_deg) > 10.0:
-            # 필요하면 디버그용 로그
-            # self.get_logger().info(f"[DBSCAN] angle={angle_deg:.1f}° → ±10° 밖, 무시")
+    def centroid_cb(self, msg: MarkerArray):
+        # yaw 정렬 안 됐으면 아직 라이다 안 씀
+        if not self.yaw_aligned:
             return
 
-        # 필터 통과한 센트로이드만 저장
-        self.center_x = msg.pose.position.x
-        self.center_y = msg.pose.position.y
+        # ===============================
+        # 1) 아직 lock 안 된 상태:
+        #    정면 ±10° 안에서 가장 가까운 부표 하나를 선택하고 lock
+        # ===============================
+        if not self.locked:
+            candidates = []
 
-        # 중심점까지의 거리
-        self.closest_dist = math.sqrt(msg.x ** 2 + msg.y ** 2)
+            for marker in msg.markers:
+                if marker.ns != "cluster_centroids_sphere":
+                    continue
 
-        # 거리 로그 출력
-        self.get_logger().info(
-            f"[DBSCAN] 정면±10° 유효 타겟: "
-            f"x={self.center_x:.2f}, y={self.center_y:.2f}, "
-            f"angle={angle_deg:.1f}°, dist={self.closest_dist:.2f} m"
-        )
+                x = marker.pose.position.x   # LiDAR 기준
+                y = marker.pose.position.y
+
+                # 전방이 -x 방향이라고 가정
+                angle_rad = math.atan2(y, -x)
+                angle_deg = math.degrees(angle_rad)
+
+                # 정면 ±10도 범위만 사용
+                if abs(angle_deg) > 10.0:
+                    continue
+
+                dist = math.sqrt(x ** 2 + y ** 2)
+                candidates.append((dist, marker, angle_deg))
+
+            # 후보가 하나도 없으면 → 현재 타겟 없음
+            if not candidates:
+                self.closest_dist = None
+                return
+
+            # 가장 가까운 센트로이드 선택 + lock-on
+            dist, target_marker, angle_deg = min(candidates, key=lambda t: t[0])
+
+            self.locked = True
+            self.locked_id = target_marker.id  # 이 id로 고정
+
+            self.center_x = target_marker.pose.position.x
+            self.center_y = target_marker.pose.position.y
+            self.closest_dist = dist
+
+            self.get_logger().info(
+                f"[LOCK] 타겟 부표 고정: id={self.locked_id}, "
+                f"x={self.center_x:.2f}, y={self.center_y:.2f}, "
+                f"angle={angle_deg:.1f}°, dist={self.closest_dist:.2f} m"
+            )
+
+        # ===============================
+        # 2) 이미 lock 된 상태:
+        #    같은 id를 가진 마커만 계속 추적
+        # ===============================
+        else:
+            target_marker = None
+
+            for marker in msg.markers:
+                if marker.ns == "cluster_centroids_sphere" and marker.id == self.locked_id:
+                    target_marker = marker
+                    break
+
+            if target_marker is None:
+                # lock된 부표를 못 찾으면 거리 업데이트 중단
+                self.closest_dist = None
+                self.get_logger().warn(
+                    f"[LOCK] lock된 부표(id={self.locked_id})를 찾지 못했습니다."
+                )
+                return
+
+            x = target_marker.pose.position.x
+            y = target_marker.pose.position.y
+
+            dist = math.sqrt(x ** 2 + y ** 2)
+            # 필요하면 각도도 다시 계산
+            # angle_rad = math.atan2(y, -x)
+            # angle_deg = math.degrees(angle_rad)
+
+            # 계속 같은 부표의 위치/거리만 업데이트
+            self.center_x = x
+            self.center_y = y
+            self.closest_dist = dist
 
     def create_circle_path(self):
         path = Path()
@@ -283,6 +358,15 @@ class SearchCircleMission(Node):
             # 유효한 라이다 타겟(정면 ±10°)이 아직 없으면 대기
             if self.closest_dist is None:
                 return
+
+            now = self.get_clock().now()
+            if self.last_dist_log_time is None or \
+               (now - self.last_dist_log_time).nanoseconds > 5e8:  # 0.5초(=5e8ns)
+                self.get_logger().info(
+                    f"[APPROACH] 현재 장애물까지 거리 = {self.closest_dist:.2f} m "
+                    f"(center=({self.center_x:.2f}, {self.center_y:.2f}))"
+                )
+                self.last_dist_log_time = now
 
             # 아직 3m 밖이면 → 직진
             if self.closest_dist > self.approach_dist:
