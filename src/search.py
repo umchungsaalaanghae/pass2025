@@ -89,14 +89,14 @@ class SearchCircleMission(Node):
         self.current_state = None
         self.start_circle = False   # 원형 선회 시작 여부
 
-        self.yaw_aligned = False     # 현재 정렬 상태
+        self.yaw_aligned = False     # 현재 정렬 상태                        
         self.yaw_finished = False    # ★ 한번 정렬 끝났는지 여부
         
         # ★ 부표 lock-on용 플래그
         self.locked = False         # True면 특정 부표에 lock
         self.locked_id = None       # lock된 Marker의 id
 
-
+        self.last_lidar_log_time = None
         self.last_dist_log_time = None
 
         # Camera window
@@ -233,84 +233,51 @@ class SearchCircleMission(Node):
         if not self.yaw_aligned:
             return
 
-        # ===============================
-        # 1) 아직 lock 안 된 상태:
-        #    정면 ±10° 안에서 가장 가까운 부표 하나를 선택하고 lock
-        # ===============================
-        if not self.locked:
-            candidates = []
+        # 정면 ±7도 안에 있는 점들 중에서 "가장 가까운" 것 하나만 선택
+        candidates = []
 
-            for marker in msg.markers:
-                if marker.ns != "cluster_centroids_sphere":
-                    continue
+        for marker in msg.markers:
+            if marker.ns != "cluster_centroids_sphere":
+                continue
 
-                x = marker.pose.position.x   # LiDAR 기준
-                y = marker.pose.position.y
+            x = marker.pose.position.x   # LiDAR 기준
+            y = marker.pose.position.y
 
-                # 전방이 -x 방향이라고 가정
-                angle_rad = math.atan2(y, -x)
-                angle_deg = math.degrees(angle_rad)
+            # 전방을 -x 방향으로 가정
+            angle_rad = math.atan2(y, -x)
+            angle_deg = math.degrees(angle_rad)
 
-                # 정면 ±10도 범위만 사용
-                if abs(angle_deg) > 10.0:
-                    continue
+            # 정면 ±7도만 사용
+            if abs(angle_deg) > 10.0:
+                continue
 
-                dist = math.sqrt(x ** 2 + y ** 2)
-                candidates.append((dist, marker, angle_deg))
+            dist = math.sqrt(x**2 + y**2)
+            candidates.append((dist, x, y, angle_deg))
 
-            # 후보가 하나도 없으면 → 현재 타겟 없음
-            if not candidates:
-                self.closest_dist = None
-                return
+        # 후보 없으면 타겟 없음
+        if not candidates:
+            self.closest_dist = None
+            return
 
-            # 가장 가까운 센트로이드 선택 + lock-on
-            dist, target_marker, angle_deg = min(candidates, key=lambda t: t[0])
+        # 거리 기준으로 가장 가까운 점 하나 선택
+        dist, cx, cy, angle_deg = min(candidates, key=lambda t: t[0])
 
-            self.locked = True
-            self.locked_id = target_marker.id  # 이 id로 고정
+        # 이 점만 계속 사용
+        self.center_x = cx
+        self.center_y = cy
+        self.closest_dist = dist
 
-            self.center_x = target_marker.pose.position.x
-            self.center_y = target_marker.pose.position.y
-            self.closest_dist = dist
-
+        # 0.5초마다 로그
+        now = self.get_clock().now()
+        if (
+            self.last_lidar_log_time is None
+            or (now - self.last_lidar_log_time).nanoseconds > 5e8
+        ):
             self.get_logger().info(
-                f"[LOCK] 타겟 부표 고정: id={self.locked_id}, "
-                f"x={self.center_x:.2f}, y={self.center_y:.2f}, "
+                f"[LIDAR-TRACK] x={self.center_x:.2f}, y={self.center_y:.2f}, "
                 f"angle={angle_deg:.1f}°, dist={self.closest_dist:.2f} m"
             )
-
-        # ===============================
-        # 2) 이미 lock 된 상태:
-        #    같은 id를 가진 마커만 계속 추적
-        # ===============================
-        else:
-            target_marker = None
-
-            for marker in msg.markers:
-                if marker.ns == "cluster_centroids_sphere" and marker.id == self.locked_id:
-                    target_marker = marker
-                    break
-
-            if target_marker is None:
-                # lock된 부표를 못 찾으면 거리 업데이트 중단
-                self.closest_dist = None
-                self.get_logger().warn(
-                    f"[LOCK] lock된 부표(id={self.locked_id})를 찾지 못했습니다."
-                )
-                return
-
-            x = target_marker.pose.position.x
-            y = target_marker.pose.position.y
-
-            dist = math.sqrt(x ** 2 + y ** 2)
-            # 필요하면 각도도 다시 계산
-            # angle_rad = math.atan2(y, -x)
-            # angle_deg = math.degrees(angle_rad)
-
-            # 계속 같은 부표의 위치/거리만 업데이트
-            self.center_x = x
-            self.center_y = y
-            self.closest_dist = dist
+            self.last_lidar_log_time = now
 
     def create_circle_path(self):
         path = Path()
