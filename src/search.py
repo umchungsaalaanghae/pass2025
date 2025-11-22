@@ -9,9 +9,9 @@ import math
 import numpy as np
 import cv2
 from cv_bridge import CvBridge
-from sensor_msgs_py import point_cloud2 as pc2
+from sensor_msgs_py import point_cloud2
 from geometry_msgs.msg import Twist, PoseStamped, Point
-from sensor_msgs.msg import PointCloud2, Image, Imu
+from sensor_msgs.msg import  Image, Imu
 from nav_msgs.msg import Path
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, SetMode
@@ -185,7 +185,7 @@ class SearchCircleMission(Node):
             # 타겟이 안 보이면 정지
             # ------------------------------
             if target_info is None:
-                self.publish_vel(0.0, 0.0)
+                self.publish_vel(0.0, 0.0) #--------------------------> 타겟이 안 보이면 정지. 근데 만약에 배가 돌아가서 계속 안보이면 어떡해? 그니까 제자리 선회나 이런걸 넣어야지. ㅇㅋ 수정하셈
                 self.yaw_aligned = False
 
             else:
@@ -233,7 +233,7 @@ class SearchCircleMission(Node):
         if not self.yaw_aligned:
             return
 
-        # 정면 ±7도 안에 있는 점들 중에서 "가장 가까운" 것 하나만 선택
+        # 정면 ±10도 안에 있는 점들 중에서 "가장 가까운" 것 하나만 선택
         candidates = []
 
         for marker in msg.markers:
@@ -247,7 +247,7 @@ class SearchCircleMission(Node):
             angle_rad = math.atan2(y, -x)
             angle_deg = math.degrees(angle_rad)
 
-            # 정면 ±7도만 사용
+            # 정면 ±10도만 사용
             if abs(angle_deg) > 10.0:
                 continue
 
