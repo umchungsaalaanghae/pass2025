@@ -68,7 +68,7 @@ class SearchCircleMission(Node):
         self.target_color = "Scissors"
         self.yaw_aligned = False
         self.closest_dist = None    # 라이다에서 들어온 장애물까지의 거리
-        self.approach_dist = 2.5   # ★ 2.5 m 이내로 접근하면 원회전 시작
+        self.approach_dist = 2.0   # ★ 2.0 m 이내로 접근하면 원회전 시작
         self.hfov_deg = 90.0
         self.image_width = 1280
         self.current_yaw = 0.0
@@ -185,9 +185,14 @@ class SearchCircleMission(Node):
             # 타겟이 안 보이면 정지
             # ------------------------------
             if target_info is None:
-                self.publish_vel(0.0, 0.0) #--------------------------> 타겟이 안 보이면 정지. 근데 만약에 배가 돌아가서 계속 안보이면 어떡해? 그니까 제자리 선회나 이런걸 넣어야지. ㅇㅋ 수정하셈
-                self.yaw_aligned = False
+                # --- 타겟이 안 보이면 정지 대신 제자리 선회 ---
+                turn_speed = 0.2  # 제자리 선회 속도 (필요하면 0.15~0.25로 조절)
+                self.publish_vel(0.0, turn_speed)
 
+                # 아직 yaw 정렬 안 됐다고 표시
+                self.yaw_aligned = False
+                return
+            
             else:
                 yaw_error = target_info
 
@@ -229,55 +234,73 @@ class SearchCircleMission(Node):
 
     # ========== 라이다 중심점 ==========
     def centroid_cb(self, msg: MarkerArray):
+
         # yaw 정렬 안 됐으면 아직 라이다 안 씀
         if not self.yaw_aligned:
             return
 
-        # 정면 ±10도 안에 있는 점들 중에서 "가장 가까운" 것 하나만 선택
         candidates = []
 
         for marker in msg.markers:
             if marker.ns != "cluster_centroids_sphere":
                 continue
 
-            x = marker.pose.position.x   # LiDAR 기준
+            x = marker.pose.position.x
             y = marker.pose.position.y
 
-            # 전방을 -x 방향으로 가정
             angle_rad = math.atan2(y, -x)
             angle_deg = math.degrees(angle_rad)
-
-            # 정면 ±10도만 사용
-            if abs(angle_deg) > 10.0:
-                continue
-
             dist = math.sqrt(x**2 + y**2)
-            candidates.append((dist, x, y, angle_deg))
 
-        # 후보 없으면 타겟 없음
+            # -------------------------
+            # ① 아직 lock 안 됨 → ±10° 필터 적용
+            # -------------------------
+            if not self.locked:
+                if abs(angle_deg) > 10.0:
+                    continue
+
+            # 후보 저장
+            candidates.append((dist, marker.id, x, y, angle_deg))
+
+        # 후보가 없으면 종료
         if not candidates:
             self.closest_dist = None
             return
 
-        # 거리 기준으로 가장 가까운 점 하나 선택
-        dist, cx, cy, angle_deg = min(candidates, key=lambda t: t[0])
+        # 가장 가까운 marker 선택
+        dist, mid, cx, cy, angle_deg = min(candidates, key=lambda t: t[0])
 
-        # 이 점만 계속 사용
+        # -------------------------
+        # ② 처음으로 lock → 이 marker만 이후 추적
+        # -------------------------
+        if not self.locked:
+            self.locked = True
+            self.locked_id = mid
+            self.get_logger().info(f"[LOCK ON] Marker ID {mid} locked as target")
+
+        # -------------------------
+        # ③ lock된 이후에는 locked_id만 추적
+        # -------------------------
+        if self.locked and mid != self.locked_id:
+            # lock이 있는데 다른 부표면 무시
+            return
+
+        # 선택된 부표 좌표 갱신
         self.center_x = cx
         self.center_y = cy
         self.closest_dist = dist
 
-        # 0.5초마다 로그
+        # 로그 주기 제한
         now = self.get_clock().now()
         if (
             self.last_lidar_log_time is None
             or (now - self.last_lidar_log_time).nanoseconds > 5e8
         ):
             self.get_logger().info(
-                f"[LIDAR-TRACK] x={self.center_x:.2f}, y={self.center_y:.2f}, "
-                f"angle={angle_deg:.1f}°, dist={self.closest_dist:.2f} m"
+                f"[TRACK] id={mid}, x={cx:.2f}, y={cy:.2f}, angle={angle_deg:.1f}°, dist={dist:.2f}"
             )
             self.last_lidar_log_time = now
+
 
     def create_circle_path(self):
         path = Path()
