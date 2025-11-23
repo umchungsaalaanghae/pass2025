@@ -11,7 +11,7 @@ import cv2
 from cv_bridge import CvBridge
 from sensor_msgs_py import point_cloud2
 from geometry_msgs.msg import Twist, PoseStamped, Point
-from sensor_msgs.msg import  Image, Imu
+from sensor_msgs.msg import Image, Imu
 from nav_msgs.msg import Path
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, SetMode
@@ -95,6 +95,12 @@ class SearchCircleMission(Node):
         # ★ 부표 lock-on용 플래그
         self.locked = False         # True면 특정 부표에 lock
         self.locked_id = None       # lock된 Marker의 id
+        
+        # ★ [수정] 락온 손실 방지용 변수 추가
+        self.max_lost_frames = 10   # 락온 마커가 사라져도 허용할 최대 프레임 수 (약 0.5초)
+        self.lost_frame_count = 0   # 마커를 놓친 프레임 카운터
+        # ★ [수정] 좌표 급변 필터링 변수 추가
+        self.max_update_dist = 1.0  # 락온된 마커가 한 프레임에 허용되는 최대 이동 거리 (1.0m)
 
         self.last_lidar_log_time = None
         self.last_dist_log_time = None
@@ -128,7 +134,7 @@ class SearchCircleMission(Node):
         mode_req.custom_mode = "GUIDED"
         self.mode_client.call_async(mode_req)
 
-    # ========== 카메라 + YOLO ==========
+    # ========== 카메라 + YOLO (수정됨) ==========
     def camera_cb(self, msg: Image):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -182,16 +188,14 @@ class SearchCircleMission(Node):
                 target_info = yaw_error
 
             # ------------------------------
-            # 타겟이 안 보이면 정지
+            # 타겟이 안 보이면 정지 → 제자리 선회
             # ------------------------------
             if target_info is None:
-                # --- 타겟이 안 보이면 정지 대신 제자리 선회 ---
-                turn_speed = 0.2  # 제자리 선회 속도 (필요하면 0.15~0.25로 조절)
-                self.publish_vel(0.0, turn_speed)
-
-                # 아직 yaw 정렬 안 됐다고 표시
+                # --- 타겟이 안 보이면 제자리 선회 ---
+                turn_speed = 0.2  # 제자리 선회 속도
+                self.publish_vel(0.0, turn_speed) # 전진 속도 0.0
                 self.yaw_aligned = False
-                return
+            
             
             else:
                 yaw_error = target_info
@@ -200,9 +204,13 @@ class SearchCircleMission(Node):
                 # Yaw 정렬 여부 판단 (±5°)
                 # ------------------------------
                 if abs(yaw_error) > 5.0:
-                    # 정렬 전 → 회전 계속
+                    # 정렬 전 → 회전 + 느린 전진
                     turn_speed = 0.2 * math.copysign(1, yaw_error)
-                    self.publish_vel(0.0, turn_speed)
+                    
+                    # 💡 [수정] 정렬 중 느린 전진 속도 (0.1 m/s) 추가
+                    forward_speed = 0.1 
+                    self.publish_vel(forward_speed, turn_speed) 
+                    
                     self.yaw_aligned = False
                 else:
                     # 정렬 완료
@@ -232,7 +240,7 @@ class SearchCircleMission(Node):
         except Exception:
             pass
 
-    # ========== 라이다 중심점 ==========
+    # ========== 라이다 중심점 (수정됨 - 락온 손실 방지 및 좌표 안정화 필터 추가) ==========
     def centroid_cb(self, msg: MarkerArray):
 
         # yaw 정렬 안 됐으면 아직 라이다 안 씀
@@ -240,7 +248,11 @@ class SearchCircleMission(Node):
             return
 
         candidates = []
-
+        found_locked_marker = False
+        
+        # ----------------------------------------
+        # 모든 마커를 후보군에 저장 (근접 물체 필터링 적용)
+        # ----------------------------------------
         for marker in msg.markers:
             if marker.ns != "cluster_centroids_sphere":
                 continue
@@ -252,55 +264,134 @@ class SearchCircleMission(Node):
             angle_deg = math.degrees(angle_rad)
             dist = math.sqrt(x**2 + y**2)
 
-            # -------------------------
-            # ① 아직 lock 안 됨 → ±10° 필터 적용
-            # -------------------------
-            if not self.locked:
-                if abs(angle_deg) > 10.0:
-                    continue
+            # --- 근접 거리 필터링 (1.0m 이내 제외) ---
+            if dist < 1.0:
+                continue
 
-            # 후보 저장
             candidates.append((dist, marker.id, x, y, angle_deg))
-
+            
+            # 락온된 마커가 있는지 확인
+            if self.locked and marker.id == self.locked_id:
+                found_locked_marker = True
+        
         # 후보가 없으면 종료
         if not candidates:
+            # 락온 상태였다면 락온 해제
+            if self.locked:
+                # 락온 마커뿐만 아니라 모든 후보가 사라진 경우 (즉시 해제)
+                self.get_logger().warn("[TRACK] All markers lost! Reverting to search mode.")
+                self.locked = False
+                self.locked_id = None
+                self.closest_dist = None
+                self.lost_frame_count = 0 # 카운터 초기화
+                
             self.closest_dist = None
             return
 
-        # 가장 가까운 marker 선택
-        dist, mid, cx, cy, angle_deg = min(candidates, key=lambda t: t[0])
 
-        # -------------------------
-        # ② 처음으로 lock → 이 marker만 이후 추적
-        # -------------------------
+        # ----------------------------------------
+        # [A] 락온된 상태 (안정적인 추적)
+        # ----------------------------------------
+        if self.locked:
+            
+            if found_locked_marker:
+                # 락온된 마커를 찾았으므로 해당 마커의 좌표를 사용
+                for dist, mid, cx, cy, angle_deg in candidates:
+                    if mid == self.locked_id:
+                        
+                        # ★ [수정] 1. 좌표 급변 필터링 (LiDAR 좌표 안정화)
+                        if self.closest_dist is not None:
+                            dist_change = math.sqrt(
+                                (cx - self.center_x)**2 + (cy - self.center_y)**2
+                            )
+                            
+                            if dist_change > self.max_update_dist:
+                                self.get_logger().warn(
+                                    f"[TRACK] Rejected large jump ({dist_change:.2f} m > {self.max_update_dist:.1f} m). Holding previous coordinates."
+                                )
+                                self.lost_frame_count = 0 # ID는 찾았으므로 손실 카운트는 초기화
+                                return # 좌표 업데이트 건너뛰고 기존 값 유지
+                        
+                        # 2. 좌표 갱신 (필터 통과 시)
+                        self.center_x = cx
+                        self.center_y = cy
+                        self.closest_dist = dist
+                        
+                        # 마커를 찾았으므로 손실 카운터를 초기화
+                        self.lost_frame_count = 0 
+                        
+                        # 로그 주기 제한
+                        now = self.get_clock().now()
+                        if (
+                            self.last_lidar_log_time is None
+                            or (now - self.last_lidar_log_time).nanoseconds > 5e8
+                        ):
+                            self.get_logger().info(
+                                f"[TRACK] id={mid}, x={cx:.2f}, y={cy:.2f}, angle={angle_deg:.1f}°, dist={dist:.2f} (Locked)"
+                            )
+                            self.last_lidar_log_time = now
+                        return # 락온 추적 완료
+
+            else:
+                # 락온된 마커를 찾지 못함 -> 카운트 증가
+                self.lost_frame_count += 1
+                
+                if self.lost_frame_count < self.max_lost_frames:
+                    # 최대 허용 프레임에 도달하지 않았으면 락온 상태 유지 (이전 좌표 사용)
+                    self.get_logger().warn(
+                        f"[TRACK] Locked marker lost ({self.lost_frame_count}/{self.max_lost_frames}). Holding previous position."
+                    )
+                    return
+                else:
+                    # 최대 허용 프레임을 초과하면 락온 해제
+                    self.get_logger().warn("[TRACK] Locked marker lost! Reverting to search mode.")
+                    self.locked = False
+                    self.locked_id = None
+                    self.closest_dist = None
+                    self.lost_frame_count = 0 # 카운터 초기화
+                    # 재탐색을 위해 함수를 다시 실행하지 않고 다음 프레임 대기
+                    return
+
+        # ----------------------------------------
+        # [B] 락온 안 된 상태 (최초 락온 시도)
+        # ----------------------------------------
         if not self.locked:
+            
+            filtered_candidates = []
+            # ±10° 필터 적용
+            for dist, mid, cx, cy, angle_deg in candidates:
+                if abs(angle_deg) <= 10.0:
+                    filtered_candidates.append((dist, mid, cx, cy, angle_deg))
+            
+            if not filtered_candidates:
+                self.closest_dist = None
+                return
+
+            # 가장 가까운 marker 선택
+            dist, mid, cx, cy, angle_deg = min(filtered_candidates, key=lambda t: t[0])
+            
+            # 최초 락온
             self.locked = True
             self.locked_id = mid
-            self.get_logger().info(f"[LOCK ON] Marker ID {mid} locked as target")
-
-        # -------------------------
-        # ③ lock된 이후에는 locked_id만 추적
-        # -------------------------
-        if self.locked and mid != self.locked_id:
-            # lock이 있는데 다른 부표면 무시
+            self.lost_frame_count = 0 # 카운터 초기화
+            self.get_logger().info(f"[LOCK ON] Marker ID {mid} locked as target (Initial Lock)")
+            
+            # 선택된 부표 좌표 갱신
+            self.center_x = cx
+            self.center_y = cy
+            self.closest_dist = dist
+            
+            # 로그 출력
+            now = self.get_clock().now()
+            if (
+                self.last_lidar_log_time is None
+                or (now - self.last_lidar_log_time).nanoseconds > 5e8
+            ):
+                self.get_logger().info(
+                    f"[TRACK] id={mid}, x={cx:.2f}, y={cy:.2f}, angle={angle_deg:.1f}°, dist={dist:.2f} (New Lock)"
+                )
+                self.last_lidar_log_time = now
             return
-
-        # 선택된 부표 좌표 갱신
-        self.center_x = cx
-        self.center_y = cy
-        self.closest_dist = dist
-
-        # 로그 주기 제한
-        now = self.get_clock().now()
-        if (
-            self.last_lidar_log_time is None
-            or (now - self.last_lidar_log_time).nanoseconds > 5e8
-        ):
-            self.get_logger().info(
-                f"[TRACK] id={mid}, x={cx:.2f}, y={cy:.2f}, angle={angle_deg:.1f}°, dist={dist:.2f}"
-            )
-            self.last_lidar_log_time = now
-
 
     def create_circle_path(self):
         path = Path()
@@ -309,6 +400,7 @@ class SearchCircleMission(Node):
 
         for i in range(36):
             angle = i * 10 * math.pi / 180.0
+            # 라이다 좌표계 (X: 전방, Y: 좌측)
             px = self.center_x + self.radius * math.cos(angle)
             py = self.center_y + self.radius * math.sin(angle)
 
@@ -345,8 +437,10 @@ class SearchCircleMission(Node):
         # 1) 아직 원형 선회 시작 전 (접근 단계)
         # --------------------------------
         if not self.start_circle:
-            # 유효한 라이다 타겟(정면 ±10°)이 아직 없으면 대기
-            if self.closest_dist is None:
+            # 유효한 라이다 타겟(락온된)이 아직 없으면 대기
+            if self.closest_dist is None or not self.locked:
+                # 락온이 안 됐거나 데이터가 없으면 정지
+                self.publish_vel(0.0, 0.0) 
                 return
 
             now = self.get_clock().now()
@@ -354,17 +448,17 @@ class SearchCircleMission(Node):
                (now - self.last_dist_log_time).nanoseconds > 5e8:  # 0.5초(=5e8ns)
                 self.get_logger().info(
                     f"[APPROACH] 현재 장애물까지 거리 = {self.closest_dist:.2f} m "
-                    f"(center=({self.center_x:.2f}, {self.center_y:.2f}))"
+                    f"(center=({self.center_x:.2f}, {self.center_y:.2f}), id={self.locked_id})"
                 )
                 self.last_dist_log_time = now
 
-            # 아직 3m 밖이면 → 직진
+            # 접근 거리 밖이면 → 직진
             if self.closest_dist > self.approach_dist:
                 # 여기서는 단순 직진 (yaw는 카메라/요요로 맞춘 상태라고 가정)
                 self.publish_vel(self.linear_speed, 0.0)
 
             else:
-                # 3m 이내 들어오면 → 멈추고 원형 경로 생성 + 선회 시작
+                # 접근 거리 이내 들어오면 → 멈추고 원형 경로 생성 + 선회 시작
                 self.publish_vel(0.0, 0.0)
 
                 if not self.start_circle:
@@ -383,20 +477,37 @@ class SearchCircleMission(Node):
         # 2) 원형 선회 완료된 경우
         # --------------------------------
         if self.completed:
+            # 완료 후 정지
+            self.publish_vel(0.0, 0.0)
             return
 
         # --------------------------------
         # 3) Circle LOS 기반 궤도 추종 (360° 회전)
         # --------------------------------
-        dx = -self.center_x
-        dy = -self.center_y
-        theta_c = math.atan2(dy, dx)
+        # 현재 중심점 좌표가 유효한지 확인
+        if self.closest_dist is None:
+            self.publish_vel(0.0, 0.0)
+            self.get_logger().warn("[CIRCLE] Lost track of center point, halting movement.")
+            return
 
+        # 기체에서 중심점까지의 벡터 (라이다 프레임: X전방, Y좌측)
+        dx = self.center_x
+        dy = self.center_y
+        
+        # 기체 기준 (0,0)에서 (dx, dy)를 바라보는 각도 (atan2(y, x))
+        # Note: 라이다 좌표계 (X:전방, Y:좌측)를 사용. atan2(Y, X)가 맞음.
+        theta_c = math.atan2(dy, dx) 
+
+        # 360도 회전 체크 로직
         if self.prev_angle is None:
             self.prev_angle = theta_c
+        
+        # 절대값 누적으로 360도 체크
+        delta_abs = abs(theta_c - self.prev_angle)
+        if delta_abs > math.pi: # 180도를 넘어서면 360도 회전한 것으로 간주
+            delta_abs = 2 * math.pi - delta_abs
 
-        delta = (theta_c - self.prev_angle + math.pi) % (2 * math.pi) - math.pi
-        self.total_angle += abs(delta)
+        self.total_angle += delta_abs
         self.prev_angle = theta_c
 
         if self.total_angle >= 2 * math.pi:
@@ -405,11 +516,15 @@ class SearchCircleMission(Node):
             self.get_logger().info("Completed 360 degree rotation")
             return
 
-        target_theta = theta_c + self.turn_dir * self.lookahead_angle
-        xt = self.radius * math.cos(target_theta)
-        yt = self.radius * math.sin(target_theta)
-        desired_heading = math.atan2(yt, xt)
+        # LOS 제어 (원의 접선 방향으로 Heading 계산)
+        if self.turn_dir == 1:
+            # 시계 방향 회전 (우측 선회)
+            desired_heading = math.atan2(-dx, dy)
+        else:
+            # 반시계 방향 회전 (좌측 선회)
+            desired_heading = math.atan2(dx, -dy)
 
+        # Yaw 에러 계산
         error_yaw = (desired_heading - self.current_yaw + math.pi) % (2 * math.pi) - math.pi
         angular_speed = self.kp_yaw * error_yaw
 
